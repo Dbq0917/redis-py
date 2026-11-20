@@ -3377,6 +3377,19 @@ class ConnectionPoolInterface(ABC):
     ) -> ConnectionInterface:
         pass
 
+    def get_dedicated_connection(self) -> ConnectionInterface:
+        """
+        Get a connection dedicated to a single long-lived consumer, such as
+        a ``PubSub`` subscription.
+
+        Pools that support dedicated connections hand out a connection that
+        regular commands can never borrow and that does not count against
+        ``max_connections``, so subscriptions can neither be starved by nor
+        starve regular traffic. The default falls back to a regular pooled
+        connection.
+        """
+        return self.get_connection()
+
     @abstractmethod
     def get_encoder(self):
         pass
@@ -4237,6 +4250,13 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
         self._created_connections = 0
         self._available_connections = []
         self._in_use_connections = set()
+        # Connections checked out through get_dedicated_connection(). They
+        # live in _in_use_connections like any other checked-out connection,
+        # but release() disconnects them instead of returning them to the
+        # available list, and they are not counted in _created_connections,
+        # so they never consume the max_connections budget of regular
+        # commands.
+        self._dedicated_connections = set()
 
         self._on_reset_after_fork()
 
@@ -4389,6 +4409,40 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
 
         return connection
 
+    def get_dedicated_connection(self) -> "ConnectionInterface":
+        """
+        Get a connection dedicated to a single long-lived consumer, such as
+        a ``PubSub`` subscription.
+
+        The connection is created outside the ``max_connections`` budget and
+        is never returned to the pool's available list: ``release()``
+        disconnects it. Regular commands therefore can never borrow a
+        connection that is or was used for a subscription, and long-lived
+        subscriptions cannot exhaust the pool.
+        """
+        self._checkpid()
+        with self._lock:
+            connection = self.make_connection(dedicated=True)
+            self._in_use_connections.add(connection)
+            self._dedicated_connections.add(connection)
+
+        # Record state transition for observability: the connection is
+        # created already checked out, so just USED +1.
+        record_connection_count(
+            pool_name=get_pool_name(self),
+            connection_state=ConnectionState.USED,
+            counter=1,
+        )
+
+        try:
+            self.ensure_connection(connection)
+        except BaseException:
+            # release the connection so that we don't leak it
+            self.release(connection)
+            raise
+
+        return connection
+
     def ensure_connection(self, connection: "Connection") -> None:
         """Ensure that the connection object is connected and valid"""
         connection.connect()
@@ -4425,9 +4479,9 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
             decode_responses=kwargs.get("decode_responses", False),
         )
 
-    def make_connection(self) -> "ConnectionInterface":
+    def make_connection(self, dedicated: bool = False) -> "ConnectionInterface":
         "Create a new connection"
-        if self._created_connections >= self.max_connections:
+        if not dedicated and self._created_connections >= self.max_connections:
             raise MaxConnectionsError("Too many connections")
 
         kwargs = dict(self.connection_kwargs)
@@ -4441,7 +4495,11 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
             connection = self.connection_class(**kwargs)
 
         # Only a connection that exists can be released, so count it here.
-        self._created_connections += 1
+        # Dedicated connections are accounted separately (see
+        # get_dedicated_connection) and stay outside the max_connections
+        # budget of regular commands.
+        if not dedicated:
+            self._created_connections += 1
 
         return connection
 
@@ -4467,6 +4525,21 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                 except KeyError:
                     # Gracefully fail when a connection is returned to this pool
                     # that the pool doesn't actually own
+                    return
+
+                if connection in self._dedicated_connections:
+                    # A dedicated connection is never returned to the
+                    # available list: a subscribed socket must not be reused
+                    # for regular commands. It was never counted in
+                    # _created_connections, so only the USED metric recorded
+                    # at checkout is balanced here.
+                    self._dedicated_connections.discard(connection)
+                    connection.disconnect()
+                    record_connection_count(
+                        pool_name=get_pool_name(self),
+                        connection_state=ConnectionState.USED,
+                        counter=-1,
+                    )
                     return
 
                 if self.owns_connection(connection):
@@ -4785,6 +4858,11 @@ class BlockingConnectionPool(ConnectionPool):
             # Keep a list of actual connection instances so that we can
             # disconnect them later.
             self._connections = []
+            # Connections checked out through get_dedicated_connection().
+            # They are created outside the queue, so they never consume one
+            # of the max_connections slots regular commands wait for, and
+            # release() disconnects them instead of queueing them back.
+            self._dedicated_connections = set()
         finally:
             if locked:
                 self._lock.release()
@@ -4957,6 +5035,45 @@ class BlockingConnectionPool(ConnectionPool):
 
         return connection
 
+    def get_dedicated_connection(self) -> "ConnectionInterface":
+        """
+        Get a connection dedicated to a single long-lived consumer, such as
+        a ``PubSub`` subscription.
+
+        The connection is created outside the queue, so it does not consume
+        one of the ``max_connections`` slots regular commands wait for, and
+        it is never queued back: ``release()`` disconnects it. Regular
+        commands therefore never block behind long-lived subscriptions.
+        """
+        self._checkpid()
+        locked = False
+        try:
+            if self._in_maintenance:
+                self._lock.acquire()
+                locked = True
+            connection = self.make_connection()
+            self._dedicated_connections.add(connection)
+        finally:
+            if locked:
+                self._lock.release()
+
+        # Record state transition for observability: the connection is
+        # created already checked out, so just USED +1.
+        record_connection_count(
+            pool_name=get_pool_name(self),
+            connection_state=ConnectionState.USED,
+            counter=1,
+        )
+
+        try:
+            self.ensure_connection(connection)
+        except BaseException:
+            # release the connection so that we don't leak it
+            self.release(connection)
+            raise
+
+        return connection
+
     def release(self, connection):
         "Releases the connection back to the pool."
         # Make sure we haven't changed process.
@@ -4967,6 +5084,23 @@ class BlockingConnectionPool(ConnectionPool):
             if self._in_maintenance:
                 self._lock.acquire()
                 locked = True
+            if connection in self._dedicated_connections:
+                # A dedicated connection is never queued back: a subscribed
+                # socket must not be reused for regular commands. It never
+                # consumed a queue slot, so no None placeholder is owed.
+                self._dedicated_connections.discard(connection)
+                try:
+                    self._connections.remove(connection)
+                except ValueError:
+                    # A reset() already forgot about it.
+                    pass
+                connection.disconnect()
+                record_connection_count(
+                    pool_name=get_pool_name(self),
+                    connection_state=ConnectionState.USED,
+                    counter=-1,
+                )
+                return
             if not self.owns_connection(connection):
                 # pool doesn't own this connection. do not add it back
                 # to the pool. instead add a None value which is a placeholder

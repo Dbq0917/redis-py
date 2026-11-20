@@ -167,6 +167,29 @@ class TestConnectionPool:
         with pytest.raises(redis.MaxConnectionsError):
             pool.get_connection()
 
+    def test_dedicated_connection_bypasses_max_connections(self):
+        pool = self.get_pool(max_connections=1, connection_class=DummyConnection)
+        pool.get_connection()
+        # The regular budget is exhausted; dedicated connections are not
+        # drawn from it.
+        with pytest.raises(redis.MaxConnectionsError):
+            pool.get_connection()
+        dedicated = pool.get_dedicated_connection()
+        assert dedicated in pool._in_use_connections
+        assert dedicated in pool._dedicated_connections
+        assert pool._created_connections == 1
+
+    def test_released_dedicated_connection_is_discarded(self):
+        pool = self.get_pool(connection_class=DummyConnection)
+        dedicated = pool.get_dedicated_connection()
+        pool.release(dedicated)
+        assert dedicated._sock is None
+        assert dedicated not in pool._available_connections
+        assert dedicated not in pool._in_use_connections
+        assert len(pool._dedicated_connections) == 0
+        # A dedicated connection never consumed the regular budget.
+        assert pool._created_connections == 0
+
     def test_capacity_survives_failed_connection_creation(self):
         pool = self.get_pool(
             max_connections=2, connection_class=failing_connection_class(2)
@@ -406,6 +429,23 @@ class TestBlockingConnectionPool:
         assert c1 != c2
         with pytest.raises(redis.ConnectionError):
             pool.get_connection()
+
+    def test_dedicated_connection_bypasses_the_queue(self):
+        pool = self.get_pool(max_connections=1, timeout=0.1)
+        pooled = pool.get_connection()
+        # The only queued slot is checked out; a dedicated connection does
+        # not wait for it.
+        dedicated = pool.get_dedicated_connection()
+        assert dedicated in pool._connections
+        assert dedicated in pool._dedicated_connections
+
+        pool.release(dedicated)
+        assert dedicated._sock is None
+        assert dedicated not in pool._connections
+        assert len(pool._dedicated_connections) == 0
+        # Nothing was queued back for the dedicated connection.
+        pool.release(pooled)
+        assert pool.pool.qsize() == 1
 
     def test_lock_released_after_checkout_in_maintenance(self):
         pool = self.get_pool()

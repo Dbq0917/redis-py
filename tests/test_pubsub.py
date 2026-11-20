@@ -1315,10 +1315,13 @@ class TestPubSubRESP3Handler:
         p.close()
         self.message = None
 
-        # The next pubsub gets the same pooled connection and has no handler
+        # A released pubsub connection is dedicated: it is disconnected and
+        # never reused, so a stale handler can never leak onto the next
+        # pubsub.
+        assert not connection.is_connected
         p2 = r.pubsub()
         p2.subscribe("foo")
-        assert p2.connection is connection
+        assert p2.connection is not connection
         assert wait_for_message(p2) == make_message("subscribe", "foo", 1)
         assert r.publish("foo", "test message") == 1
         assert wait_for_message(p2) == make_message("message", "foo", "test message")
@@ -1839,6 +1842,86 @@ class TestPubSubConnectionKilled:
                 r.client_kill_filter(_id=client["id"])
         with pytest.raises(ConnectionError):
             wait_for_message(p)
+
+
+@pytest.mark.onlynoncluster
+class TestPubSubDedicatedConnections:
+    """
+    PubSub connections are dedicated: they are created outside the pool's
+    max_connections budget and are never returned to the pool's available
+    list, so long-lived subscriptions can neither starve nor be starved by
+    regular commands.
+    """
+
+    def test_subscriptions_do_not_exhaust_connection_pool(self, request):
+        r = _get_client(
+            redis.Redis, request, max_connections=2, single_connection_client=False
+        )
+        pool = r.connection_pool
+        p1 = r.pubsub()
+        p2 = r.pubsub()
+        p1.subscribe("foo")
+        p2.subscribe("bar")
+        # Two subscriptions on a max_connections=2 pool: both hold dedicated
+        # connections that leave the regular budget untouched.
+        assert len(pool._dedicated_connections) == 2
+        assert pool._created_connections == 0
+
+        # Regular commands, including concurrent ones within the pool's
+        # budget, are not queued behind the subscriptions.
+        assert r.ping()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(r.ping) for _ in range(8)]
+            assert all(future.result() for future in futures)
+
+        p1.close()
+        p2.close()
+        assert len(pool._dedicated_connections) == 0
+        assert r.ping()
+
+    def test_regular_commands_never_borrow_subscription_connection(self, request):
+        r = _get_client(redis.Redis, request, single_connection_client=False)
+        pool = r.connection_pool
+        p = r.pubsub()
+        p.subscribe("foo")
+        subscribed_connection = p.connection
+
+        connection = pool.get_connection()
+        try:
+            assert connection is not subscribed_connection
+        finally:
+            pool.release(connection)
+
+        # Once released, the subscription's connection is disconnected and
+        # discarded rather than returned to the pool.
+        p.close()
+        assert not subscribed_connection.is_connected
+        assert subscribed_connection not in pool._available_connections
+        assert r.ping()
+        assert subscribed_connection not in pool._available_connections
+
+    def test_commands_do_not_queue_behind_subscriptions_blocking_pool(self, request):
+        redis_url = request.config.getoption("--redis-url")
+        protocol_opt = request.config.getoption("--protocol")
+        kwargs = {"protocol": protocol_opt} if protocol_opt else {}
+        pool = redis.BlockingConnectionPool.from_url(
+            redis_url, max_connections=1, timeout=0.5, **kwargs
+        )
+        r = redis.Redis(connection_pool=pool)
+        try:
+            p = r.pubsub()
+            p.subscribe("foo")
+            # The subscription's dedicated connection did not consume the
+            # pool's only slot: a regular command neither blocks nor times
+            # out waiting for one.
+            start = time.monotonic()
+            assert r.ping()
+            assert time.monotonic() - start < 0.5
+            p.close()
+            assert r.ping()
+        finally:
+            r.close()
+            pool.disconnect()
 
 
 class TestPubSubTimeouts:

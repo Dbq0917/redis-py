@@ -1405,7 +1405,16 @@ class PubSub:
         Ensure that the PubSub is connected
         """
         if self.connection is None:
-            self.connection = await self.connection_pool.get_connection()
+            # A subscription pins its connection for a long time, so take a
+            # dedicated one: regular commands can never borrow it and it
+            # does not count against the pool's max_connections budget.
+            # Pools without dedicated support fall back to a regular one.
+            get_connection = getattr(
+                self.connection_pool,
+                "get_dedicated_connection",
+                self.connection_pool.get_connection,
+            )
+            self.connection = await get_connection()
             # register a callback that re-subscribes to any channels we
             # were listening to when we were disconnected
             self.connection.register_connect_callback(self.on_connect)

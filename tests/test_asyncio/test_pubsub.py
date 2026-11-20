@@ -1211,10 +1211,13 @@ class TestPubSubRESP3Handler:
         await p.aclose()
         self.message = None
 
-        # The next pubsub gets the same pooled connection and has no handler
+        # A released pubsub connection is dedicated: it is disconnected and
+        # never reused, so a stale handler can never leak onto the next
+        # pubsub.
+        assert not connection.is_connected
         p2 = r.pubsub()
         await p2.subscribe("foo")
-        assert p2.connection is connection
+        assert p2.connection is not connection
         assert await wait_for_message(p2) == make_message("subscribe", "foo", 1)
         assert await r.publish("foo", "test message") == 1
         assert await wait_for_message(p2) == make_message(
@@ -1530,6 +1533,91 @@ class TestPubSubConnectionKilled:
                 await r.client_kill_filter(_id=client["id"])
         with pytest.raises(ConnectionError):
             await wait_for_message(p)
+
+
+@pytest.mark.onlynoncluster
+class TestPubSubDedicatedConnections:
+    """
+    PubSub connections are dedicated: they are created outside the pool's
+    max_connections budget and are never returned to the pool's available
+    list, so long-lived subscriptions can neither starve nor be starved by
+    regular commands.
+    """
+
+    async def test_subscriptions_do_not_exhaust_connection_pool(self, create_redis):
+        r = await create_redis(max_connections=2, single_connection_client=False)
+        pool = r.connection_pool
+        in_use_baseline = len(pool._in_use_connections)
+        p1 = r.pubsub()
+        p2 = r.pubsub()
+        await p1.subscribe("foo")
+        await p2.subscribe("bar")
+        # Two subscriptions on a max_connections=2 pool: both hold dedicated
+        # connections that leave the regular budget untouched.
+        assert len(pool._dedicated_connections) == 2
+        assert (
+            len(pool._in_use_connections) - len(pool._dedicated_connections)
+            == in_use_baseline
+        )
+
+        # Regular commands, including concurrent ones within the pool's
+        # budget, are not queued behind the subscriptions.
+        assert await r.ping()
+        for _ in range(4):
+            assert all(await asyncio.gather(r.ping(), r.ping()))
+
+        await p1.aclose()
+        await p2.aclose()
+        assert len(pool._dedicated_connections) == 0
+        assert await r.ping()
+
+    async def test_regular_commands_never_borrow_subscription_connection(
+        self, create_redis
+    ):
+        r = await create_redis(single_connection_client=False)
+        pool = r.connection_pool
+        p = r.pubsub()
+        await p.subscribe("foo")
+        subscribed_connection = p.connection
+
+        connection = await pool.get_connection()
+        try:
+            assert connection is not subscribed_connection
+        finally:
+            await pool.release(connection)
+
+        # Once released, the subscription's connection is disconnected and
+        # discarded rather than returned to the pool.
+        await p.aclose()
+        assert not subscribed_connection.is_connected
+        assert subscribed_connection not in pool._available_connections
+        assert await r.ping()
+        assert subscribed_connection not in pool._available_connections
+
+    async def test_commands_do_not_queue_behind_subscriptions_blocking_pool(
+        self, request
+    ):
+        redis_url = request.config.getoption("--redis-url")
+        protocol_opt = request.config.getoption("--protocol")
+        kwargs = {"protocol": protocol_opt} if protocol_opt else {}
+        pool = redis.BlockingConnectionPool.from_url(
+            redis_url, max_connections=1, timeout=0.5, **kwargs
+        )
+        r = redis.Redis(connection_pool=pool)
+        try:
+            p = r.pubsub()
+            await p.subscribe("foo")
+            # The subscription's dedicated connection did not consume the
+            # pool's only slot: a regular command neither blocks nor times
+            # out waiting for one.
+            start = time.monotonic()
+            assert await r.ping()
+            assert time.monotonic() - start < 0.5
+            await p.aclose()
+            assert await r.ping()
+        finally:
+            await r.aclose()
+            await pool.disconnect()
 
 
 @pytest.mark.onlynoncluster
@@ -2494,8 +2582,9 @@ class TestPubSubAcloseCancellation:
     """
     Cancelling the task that runs PubSub.aclose() (e.g. a cancelled
     anyio/Starlette scope tearing down an ``async with r.pubsub()``) must not
-    leak the pubsub connection: it still has to be disconnected and returned
-    to the pool.
+    leak the pubsub connection: it still has to be disconnected and dropped
+    from the pool's bookkeeping. PubSub connections are dedicated, so they
+    are discarded on release rather than returned to the available list.
     """
 
     @staticmethod
@@ -2542,7 +2631,7 @@ class TestPubSubAcloseCancellation:
 
         assert p.connection is None
         assert not leased.is_connected
-        assert leased in pool._available_connections
+        assert leased not in pool._available_connections
         assert p.channels == {}
         assert len(pool._in_use_connections) == in_use_before
 
@@ -2587,7 +2676,7 @@ class TestPubSubAcloseCancellation:
         await self._cancel(task, started, pool._lock.release)
 
         assert p.connection is None
-        assert leased in pool._available_connections
+        assert leased not in pool._available_connections
         assert len(pool._in_use_connections) == in_use_before
 
     async def test_cancelled_subscribe_then_cancelled_aclose_does_not_leak(

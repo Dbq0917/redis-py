@@ -7,6 +7,7 @@ import pytest
 import pytest_asyncio
 import redis.asyncio as redis
 from redis._parsers import _AsyncHiredisParser, _AsyncRESP3Parser
+from redis.exceptions import MaxConnectionsError
 from redis.utils import HIREDIS_AVAILABLE
 from redis.asyncio.connection import (
     BlockingConnectionPool,
@@ -205,6 +206,28 @@ class TestConnectionPool:
             await pool.get_connection()
             with pytest.raises(redis.ConnectionError):
                 await pool.get_connection()
+
+    async def test_dedicated_connection_bypasses_max_connections(self):
+        async with self.get_pool(
+            max_connections=1, connection_class=DummyConnection
+        ) as pool:
+            await pool.get_connection()
+            # The regular budget is exhausted; dedicated connections are not
+            # drawn from it.
+            with pytest.raises(MaxConnectionsError):
+                await pool.get_connection()
+            dedicated = await pool.get_dedicated_connection()
+            assert dedicated in pool._in_use_connections
+            assert dedicated in pool._dedicated_connections
+
+    async def test_released_dedicated_connection_is_discarded(self):
+        async with self.get_pool(connection_class=DummyConnection) as pool:
+            dedicated = await pool.get_dedicated_connection()
+            await pool.release(dedicated)
+            assert not dedicated.is_connected
+            assert dedicated not in pool._available_connections
+            assert dedicated not in pool._in_use_connections
+            assert len(pool._dedicated_connections) == 0
 
     @pytest.mark.fixed_client
     async def test_failed_re_auth_does_not_stop_the_other_connections(self):
@@ -556,6 +579,20 @@ class TestBlockingConnectionPool:
             await conn.connect()
             await pool.disconnect(inuse_connections=False)
             assert conn.is_connected
+
+    async def test_dedicated_connection_bypasses_the_wait(self):
+        async with self.get_pool(max_connections=1, timeout=0.1) as pool:
+            pooled = await pool.get_connection()
+            # The only slot is checked out; a dedicated connection does not
+            # wait for it.
+            dedicated = await pool.get_dedicated_connection()
+            assert dedicated in pool._dedicated_connections
+
+            await pool.release(dedicated)
+            assert not dedicated.is_connected
+            assert dedicated not in pool._available_connections
+            assert len(pool._dedicated_connections) == 0
+            await pool.release(pooled)
 
     async def test_pool_context_manager(self):
         pool = redis.BlockingConnectionPool(connection_class=DummyConnection)

@@ -2287,6 +2287,19 @@ class ConnectionPoolInterface(ABC):
     ) -> "AbstractConnection":
         pass
 
+    async def get_dedicated_connection(self) -> "AbstractConnection":
+        """
+        Get a connection dedicated to a single long-lived consumer, such as
+        a ``PubSub`` subscription.
+
+        Pools that support dedicated connections hand out a connection that
+        regular commands can never borrow and that does not count against
+        ``max_connections``, so subscriptions can neither be starved by nor
+        starve regular traffic. The default falls back to a regular pooled
+        connection.
+        """
+        return await self.get_connection()
+
     @abstractmethod
     def get_encoder(self) -> "Encoder":
         pass
@@ -3156,6 +3169,12 @@ class ConnectionPool(
 
         self._available_connections: List[AbstractConnection] = []
         self._in_use_connections: Set[AbstractConnection] = set()
+        # Connections checked out through get_dedicated_connection(). They
+        # live in _in_use_connections like any other checked-out connection,
+        # but release() disconnects them instead of returning them to the
+        # available list, and they are excluded from the max_connections
+        # budget of regular commands.
+        self._dedicated_connections: Set[AbstractConnection] = set()
         self.encoder_class = self.connection_kwargs.get("encoder_class", Encoder)
         self._lock = asyncio.Lock()
         self._background_releases: Set[asyncio.Task] = set()
@@ -3251,6 +3270,7 @@ class ConnectionPool(
 
         self._available_connections = []
         self._in_use_connections = weakref.WeakSet()
+        self._dedicated_connections = weakref.WeakSet()
 
     def __del__(self) -> None:
         """Clean up connection pool and record metrics when garbage collected."""
@@ -3285,9 +3305,9 @@ class ConnectionPool(
 
     def can_get_connection(self) -> bool:
         """Return True if a connection can be retrieved from the pool."""
-        return (
-            self._available_connections
-            or len(self._in_use_connections) < self.max_connections
+        return self._available_connections or (
+            len(self._in_use_connections) - len(self._dedicated_connections)
+            < self.max_connections
         )
 
     @deprecated_args(
@@ -3352,10 +3372,46 @@ class ConnectionPool(
         try:
             connection = self._available_connections.pop()
         except IndexError:
-            if len(self._in_use_connections) >= self.max_connections:
+            if (
+                len(self._in_use_connections) - len(self._dedicated_connections)
+                >= self.max_connections
+            ):
                 raise MaxConnectionsError("Too many connections") from None
             connection = self.make_connection()
         self._in_use_connections.add(connection)
+        return connection
+
+    async def get_dedicated_connection(self) -> "AbstractConnection":
+        """
+        Get a connection dedicated to a single long-lived consumer, such as
+        a ``PubSub`` subscription.
+
+        The connection is created outside the ``max_connections`` budget and
+        is never returned to the pool's available list: ``release()``
+        disconnects it. Regular commands therefore can never borrow a
+        connection that is or was used for a subscription, and long-lived
+        subscriptions cannot exhaust the pool.
+        """
+        async with self._lock:
+            connection = self.make_connection()
+            self._in_use_connections.add(connection)
+            self._dedicated_connections.add(connection)
+
+        # Record state transition for observability: the connection is
+        # created already checked out, so just USED +1.
+        await record_connection_count(
+            pool_name=get_pool_name(self),
+            connection_state=ConnectionState.USED,
+            counter=1,
+        )
+
+        # We now perform the connection check outside of the lock.
+        try:
+            await self.ensure_connection(connection)
+        except BaseException:
+            await self.release(connection)
+            raise
+
         return connection
 
     def get_encoder(self):
@@ -3411,14 +3467,21 @@ class ConnectionPool(
             listener_error = e
         locked = False
         disconnect_failed = False
+        dedicated = False
         try:
             async with self._lock:
                 locked = True
                 # Connections should always be returned to the correct pool,
                 # not doing so is an error that will cause an exception here.
                 self._in_use_connections.remove(connection)
+                dedicated = connection in self._dedicated_connections
+                if dedicated:
+                    # A dedicated connection is never returned to the
+                    # available list: a subscribed socket must not be reused
+                    # for regular commands.
+                    self._dedicated_connections.discard(connection)
                 try:
-                    if connection.should_reconnect():
+                    if dedicated or connection.should_reconnect():
                         if logger.isEnabledFor(logging.DEBUG):
                             logger.debug(
                                 "Disconnecting released connection marked for "
@@ -3433,33 +3496,39 @@ class ConnectionPool(
                     raise
                 finally:
                     # Even if disconnect() is cancelled, don't drop it.
-                    self._available_connections.append(connection)
+                    if not dedicated:
+                        self._available_connections.append(connection)
         except BaseException as e:
             if disconnect_failed:
-                # It is back in the pool: still record the metrics.
-                self._run_in_background(self._finish_release(connection))
+                # The checkout is over either way: still record the metrics.
+                self._run_in_background(self._finish_release(connection, dedicated))
             elif not locked and isinstance(e, asyncio.CancelledError):
                 # Cancelled while waiting for a contended lock: don't leak.
                 self._release_in_background(connection)
             raise
 
-        await self._finish_release(connection)
+        await self._finish_release(connection, dedicated)
         if listener_error is not None:
             raise listener_error
 
-    async def _finish_release(self, connection: AbstractConnection) -> None:
-        # Record state transition: USED -> IDLE
+    async def _finish_release(
+        self, connection: AbstractConnection, dedicated: bool = False
+    ) -> None:
+        # Record state transition: USED -> IDLE. A dedicated connection is
+        # discarded rather than returned, so it only balances the USED
+        # counter recorded at checkout.
         pool_name = get_pool_name(self)
         await record_connection_count(
             pool_name=pool_name,
             connection_state=ConnectionState.USED,
             counter=-1,
         )
-        await record_connection_count(
-            pool_name=pool_name,
-            connection_state=ConnectionState.IDLE,
-            counter=1,
-        )
+        if not dedicated:
+            await record_connection_count(
+                pool_name=pool_name,
+                connection_state=ConnectionState.IDLE,
+                counter=1,
+            )
 
     def _release_in_background(self, connection: AbstractConnection) -> None:
         if asyncio.current_task() in self._background_releases:
