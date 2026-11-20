@@ -574,6 +574,42 @@ class TestPipeline:
         assert await client.get("b") == b"b1"
 
     @pytest.mark.onlynoncluster
+    async def test_mid_pipeline_error_keeps_replies_paired_with_commands(self, r):
+        # A server error on one command must be paired with that command instead
+        # of stopping the read loop: the later replies stay aligned with their
+        # commands and the pooled connection is handed back clean.
+        await r.flushdb()
+        async with r.pipeline(transaction=False) as pipe:
+            pipe.set("a", 1)
+            # the zrem is invalid because we don't pass any keys to it
+            pipe.zrem("b")
+            pipe.set("b", 2)
+            pipe.get("a")
+            result = await pipe.execute(raise_on_error=False)
+
+        assert result[0] is True
+        assert isinstance(result[1], redis.ResponseError)
+        assert result[2] is True
+        assert result[3] == b"1"
+        assert await r.get("b") == b"2"
+
+        # The default still raises the first error, annotated with its command,
+        # and every reply has already been consumed.
+        async with r.pipeline(transaction=False) as pipe:
+            pipe.set("c", 3)
+            pipe.zrem("b")
+            pipe.set("d", 4)
+            with pytest.raises(redis.ResponseError) as ex:
+                await pipe.execute()
+            assert str(ex.value).startswith(
+                "Command # 2 (ZREM b) of pipeline caused error: "
+            )
+
+        client = redis.asyncio.Redis(connection_pool=r.connection_pool)
+        assert await client.get("c") == b"3"
+        assert await client.get("d") == b"4"
+
+    @pytest.mark.onlynoncluster
     @skip_if_redis_enterprise()
     @skip_if_server_version_lt("6.0.0")
     async def test_exec_error_in_pipeline_redacts_credentials(self, r):

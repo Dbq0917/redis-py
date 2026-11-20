@@ -242,6 +242,42 @@ class TestPipeline:
         assert client.get("b") == b"b1"
 
     @pytest.mark.onlynoncluster
+    def test_mid_pipeline_error_keeps_replies_paired_with_commands(self, r):
+        # A server error on one command must be paired with that command instead
+        # of stopping the read loop: the later replies stay aligned with their
+        # commands and the pooled connection is handed back clean.
+        r.flushdb()
+        with r.pipeline(transaction=False) as pipe:
+            pipe.set("a", 1)
+            # the zrem is invalid because we don't pass any keys to it
+            pipe.zrem("b")
+            pipe.set("b", 2)
+            pipe.get("a")
+            result = pipe.execute(raise_on_error=False)
+
+        assert result[0] is True
+        assert isinstance(result[1], redis.ResponseError)
+        assert result[2] is True
+        assert result[3] == b"1"
+        assert r.get("b") == b"2"
+
+        # The default still raises the first error, annotated with its command,
+        # and every reply has already been consumed.
+        with r.pipeline(transaction=False) as pipe:
+            pipe.set("c", 3)
+            pipe.zrem("b")
+            pipe.set("d", 4)
+            with pytest.raises(redis.ResponseError) as ex:
+                pipe.execute()
+            assert str(ex.value).startswith(
+                "Command # 2 (ZREM b) of pipeline caused error: "
+            )
+
+        client = redis.Redis(connection_pool=r.connection_pool)
+        assert client.get("c") == b"3"
+        assert client.get("d") == b"4"
+
+    @pytest.mark.onlynoncluster
     def test_parse_error_raised_transaction(self, r):
         with r.pipeline() as pipe:
             pipe.multi()
